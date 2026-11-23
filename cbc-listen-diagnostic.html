@@ -234,111 +234,40 @@
   async function loadLatestEpisode(key) {
     const requestId = feedRequest;
     const show = SHOWS[key];
-
-    // CBC's RSS feeds are valid public feeds, but browsers normally cannot
-    // read them directly from a local file because of cross-origin rules.
-    // Try the CBC feed directly, then two public feed-fetch routes.
-    const feedUrl = show.feed;
-    const feedRoutes = [
-      feedUrl,
-      "https://proxy.cors.dev/" + feedUrl,
-      "https://api.allorigins.win/raw?url=" + encodeURIComponent(feedUrl)
-    ];
-
-    let lastProblem = "The podcast feed could not be reached.";
-
-    for (const route of feedRoutes) {
-      try {
-        const response = await fetch(route, { cache: "no-store" });
-        if (!response.ok) {
-          lastProblem = "Feed service returned HTTP " + response.status + ".";
-          continue;
-        }
-
-        const xmlText = await response.text();
-        const xml = new DOMParser().parseFromString(xmlText, "application/xml");
-        if (xml.getElementsByTagName("parsererror").length) {
-          lastProblem = "The feed response was not readable XML.";
-          continue;
-        }
-
-        // Use localName so tags work whether or not CBC adds XML namespaces.
-        const descendants = (node) => Array.from(node.getElementsByTagName("*"));
-        const findTag = (node, localName) =>
-          descendants(node).find(el => (el.localName || el.nodeName.split(":").pop()).toLowerCase() === localName.toLowerCase()) || null;
-        const getText = (node, localName) => findTag(node, localName)?.textContent?.trim() || "";
-
-        const items = Array.from(xml.getElementsByTagName("item"));
-        if (!items.length) {
-          lastProblem = "The feed opened, but it contained no podcast episodes.";
-          continue;
-        }
-
-        // Select the newest item that actually has an audio enclosure.
-        // This avoids failing if CBC places a non-audio notice at the top.
-        const playableItems = items.map(item => {
-          const tags = descendants(item);
-          const enclosure = tags.find(el =>
-            (el.localName || "").toLowerCase() === "enclosure"
-          );
-          const mediaContent = tags.find(el =>
-            (el.localName || "").toLowerCase() === "content" &&
-            (el.getAttribute("url") || el.getAttribute("href"))
-          );
-          const enclosureLink = tags.find(el =>
-            (el.localName || "").toLowerCase() === "link" &&
-            (el.getAttribute("rel") || "").toLowerCase() === "enclosure"
-          );
-
-          const audioUrl =
-            enclosure?.getAttribute("url") ||
-            enclosure?.getAttribute("href") ||
-            mediaContent?.getAttribute("url") ||
-            mediaContent?.getAttribute("href") ||
-            enclosureLink?.getAttribute("href") ||
-            "";
-
-          const dateText = getText(item, "pubDate") || getText(item, "published") || getText(item, "date");
-          const dateValue = Date.parse(dateText) || 0;
-          return {
-            audioUrl,
-            title: getText(item, "title") || "Latest episode",
-            dateValue
-          };
-        }).filter(item => item.audioUrl);
-
-        if (!playableItems.length) {
-          lastProblem = "The feed opened, but no episode audio link was found.";
-          continue;
-        }
-
-        playableItems.sort((a, b) => b.dateValue - a.dateValue);
-        const latest = playableItems[0];
-
-        if (requestId !== feedRequest || currentKey !== key) return;
-
-        currentEpisodeUrl = latest.audioUrl;
-        episodeTitle.textContent = latest.title;
-        setState("stopped", "Latest episode ready. Tap PLAY to listen");
-        return;
-      } catch (error) {
-        lastProblem = error && error.message ? error.message : "A network or browser access error occurred.";
+    try {
+      const response = await fetch("./latest.json?refresh=" + Date.now(), { cache: "no-store" });
+      if (!response.ok) throw new Error("Episode data is not published yet (HTTP " + response.status + ").");
+      const data = await response.json();
+      const latest = data && data.shows && data.shows[key];
+      if (!latest || !latest.audio_url) {
+        const detail = data && data.errors && data.errors[key];
+        throw new Error(detail || "CBC has not supplied a playable episode yet.");
       }
+      if (requestId !== feedRequest || currentKey !== key) return;
+      currentEpisodeUrl = latest.audio_url;
+      episodeTitle.textContent = latest.title || "Latest episode";
+      setState("stopped", "Latest episode ready. Tap PLAY to listen");
+      if ("mediaSession" in navigator && "MediaMetadata" in window) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: latest.title || show.title,
+          artist: show.title,
+          album: "CBC Listen"
+        });
+      }
+    } catch (error) {
+      if (requestId !== feedRequest || currentKey !== key) return;
+      currentEpisodeUrl = "";
+      episodeTitle.textContent = "Could not load the latest episode.";
+      setState("stopped", (error && error.message ? error.message : "Episode data could not be loaded.") + " Please try again later.");
+      console.warn("CBC podcast data error for " + show.title + ":", error);
     }
-
-    if (requestId !== feedRequest || currentKey !== key) return;
-    currentEpisodeUrl = "";
-    episodeTitle.textContent = "Could not load the latest episode.";
-    setState("stopped", lastProblem + " Please try again.");
-    console.warn("CBC podcast feed error for " + show.title + ":", lastProblem);
   }
 
   async function startAudio() {
     if (wantPlaying) return;
     if (currentKey !== "radio" && !currentEpisodeUrl) {
-      setState("loading", "Loading the latest episode…");
-      await loadLatestEpisode(currentKey);
-      if (!currentEpisodeUrl) return;
+      setState("loading", "Still loading the latest episode. Please tap PLAY again in a moment.");
+      return;
     }
     wantPlaying = true;
     setState("loading", "Connecting…");
